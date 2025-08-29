@@ -1,0 +1,418 @@
+import time
+import math
+import numpy as np
+import serial
+from typing import Optional, Tuple
+
+# --------  Ion Gauge and thermister  --------
+class RGM401AndThermisters:
+    """
+    Arduino serial reader for an RGM401 ion gauge front-end + two thermistors.
+    Responsibilities:
+      - Manage the serial connection (open/close/status)
+      - Read one newline-terminated CSV record from Arduino
+      - Parse "<v_room>,<v_cryo>,<v_ICR>,<v_ICH>" into floats (volts)
+      - Convert voltages to pressures via P = 10**(a*V + b)
+      - Convert thermistor voltages (ICR/ICH) to temperatures via Steinhart-Hart
+    Expected Arduino line (no labels, 4 values):
+        "0.881,3.300,1.234,1.567\\r\\n"
+        # room, cryo, ICR, ICH  (all in volts)
+    Example:
+        >>> ig = RGM401AndThermisters(port="COM7", baudrate=115200, autoconnect=True)
+        >>> p_room, p_cryo, t_icr, t_ich = ig.get_all()
+        >>> print(f"{p_room:.3e} Pa, {p_cryo:.3e} Pa | {t_icr:.2f} degree C, {t_ich:.2f} degree C")
+        >>> ig.close()
+    Notes:
+      - If `autoconnect=True`, the constructor opens the port immediately.
+      - Many Arduino boards reset on open; `connect()` waits ~2 s for stable output.
+    """
+
+    def __init__(
+        self,
+        port: str = "COM7",
+        baudrate: int = 115200,
+        timeout: float = 1.0,
+        autoconnect: bool = True,
+    ):
+        """
+        Initialize the reader configuration.
+        Args:
+            port: Serial port name (e.g., "COM7" on Windows, "/dev/ttyACM0" on Linux).
+            baudrate: Serial baud rate; must match the Arduino sketch.
+            timeout: Read timeout in seconds. Returns empty string on timeout.
+            autoconnect: If True, call `connect()` at the end of initialization.
+        Raises:
+            serial.SerialException: If autoconnect is True and opening the port fails.
+        """
+
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.ser: Optional[serial.Serial] = None
+
+        self._set_conversion_constants()
+
+        if autoconnect:
+            self.connect()
+
+    def _set_conversion_constants(self):
+        """
+        Set default conversion constants (edit to match your hardware/calibration).
+        """
+
+        # Ion gauge pressure conversion: P = 10^(a*V + b)
+        # a depends on any front-end divider; b from gauge calibration/spec.
+        self.a = 3.0
+        self.b = -10.0
+
+        # Thermistor (Steinhart-Hart) constants for 100k NTC example
+        # 1/T = A + B*ln(R/R25) + C*ln^2(R/R25) + D*ln^3(R/R25)
+        self.A = 3.354016e-03
+        self.B = 2.460382e-04
+        self.C = 3.405377e-06
+        self.D = 1.034240e-07
+        self.R25 = 1.0e5       # 25 degree C nominal resistance (ohms)
+
+        # Divider and supply parameters for ICR/ICH channels
+        self.Vs = 3.3          # ADC/thermistor divider supply (volts)
+        self.R0_ICR = 1.0e5    # Series/reference resistor with ICR thermistor (ohms)
+        self.R0_ICH = 1.0e5    # Series/reference resistor with ICH thermistor (ohms)
+
+        # Numerical guard to avoid division-by-zero near rails
+        self._eps_v = 1e-6
+
+    # --- lifecycle ---
+    def connect(self) -> None:
+        """
+        Open the serial port and give the board time to reset.
+        Behavior:
+            - Closes any existing handle
+            - Opens a new `serial.Serial` with the configured parameters
+            - Sleeps ~2 s to allow boards that reset-on-open to stabilize
+            - Clears boot-time noise from input/output buffers
+        """
+
+        self.close()
+        self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
+        time.sleep(2.0)  # many boards reset on open; wait for complete frames
+        self.ser.reset_input_buffer()
+        self.ser.reset_output_buffer()
+
+    def close(self) -> None:
+        """Close the serial port if it is open (idempotent)."""
+
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+
+        self.ser = None
+
+    @property
+    def is_open(self) -> bool:
+        """Return True if the underlying serial port is open, False otherwise."""
+        return bool(self.ser and self.ser.is_open)
+
+    # --- conversion helpers ---
+    def _pressure_from_voltage(self, v: float) -> float:
+        """Pascals from ion-gauge voltage using P = 10**(a*v + b)."""
+        return math.pow(10.0, self.a * v + self.b)
+
+    def _thermistor_temp_c(self, v: float, r0: float) -> float:
+        """
+        Convert thermistor divider voltage to degree C using Steinhart-Hart.
+        Assumes divider topology: Vs -> R0 -> node -> R_therm -> GND,
+        and ADC measures node voltage 'v'. Then R_therm = R0 * v / (Vs - v).
+        """
+
+        # Guard against rail/invalid voltages
+        if v <= self._eps_v or v >= (self.Vs - self._eps_v):
+            return float("nan")
+
+        r_th = r0 * (v / (self.Vs - v))
+        ln_ratio = math.log(r_th / self.R25)
+        inv_T = self.A + self.B * ln_ratio + self.C * (ln_ratio ** 2) + self.D * (ln_ratio ** 3)
+
+        if inv_T <= 0.0:
+            return float("nan")
+        T_k = 1.0 / inv_T
+        return T_k - 273.15
+
+    # --- read & parse ---
+    def read_line(self, max_bytes: int = 256) -> str:
+        """
+        Read a single record terminated by newline (b'\\n') and decode to text.
+        Args:
+            max_bytes: Upper bound on bytes to read before giving up.
+        Returns:
+            The decoded text (may include CR/LF). Empty string on timeout.
+        Raises:
+            RuntimeError: If the serial port is not open.
+        """
+
+        if not self.is_open:
+            raise RuntimeError("Serial port is not open. Call connect() first.")
+
+        data = self.ser.read_until(b"\n", max_bytes)
+
+        return data.decode("ascii", errors="ignore")
+
+    def read_voltages(self, max_bytes: int = 256) -> Tuple[float, float, float, float]:
+        """
+        Read one CSV line and parse into four voltages (V).
+        Expected line (no labels):
+            "<v_room>,<v_cryo>,<v_ICR>,<v_ICH>\\r\\n"
+        Args:
+            max_bytes: Upper bound on bytes to read for the line.
+        Returns:
+            (v_room, v_cryo, v_ICR, v_ICH) as floats in volts.
+        Raises:
+            RuntimeError: On timeout (empty line), malformed CSV, or float parsing failure.
+        """
+
+        line = self.read_line(max_bytes).strip()
+        if not line:
+            raise RuntimeError("Empty line (timeout).")
+
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 4:
+            raise RuntimeError(f"Expected 4 CSV values, got {len(parts)}: {line!r}")
+
+        try:
+            v_room = float(parts[0])
+            v_cryo = float(parts[1])
+            v_icr  = float(parts[2])
+            v_ich  = float(parts[3])
+        except ValueError:
+            raise RuntimeError(f"Cannot parse floats from line: {line!r}")
+
+        return v_room, v_cryo, v_icr, v_ich
+
+    # --- high-level APIs ---
+    def get_pressures(self, max_bytes: int = 256) -> Tuple[float, float]:
+        """
+        Read voltages and convert the first two channels to pressures (Pa).
+        Returns:
+            (pressure_room, pressure_cryo) in Pascals.
+        """
+
+        v_room, v_cryo, _, _ = self.read_voltages(max_bytes)
+        p_room = self._pressure_from_voltage(v_room)
+        p_cryo = self._pressure_from_voltage(v_cryo)
+
+        return p_room, p_cryo
+
+    def get_temperatures(self, max_bytes: int = 256) -> Tuple[float, float]:
+        """
+        Read voltages and convert ICR/ICH channels to temperatures (degree C).
+        Returns:
+            (T_ICR_C, T_ICH_C) in degrees Celsius.
+        """
+
+        _, _, v_icr, v_ich = self.read_voltages(max_bytes)
+        t_icr = self._thermistor_temp_c(v_icr, self.R0_ICR)
+        t_ich = self._thermistor_temp_c(v_ich, self.R0_ICH)
+
+        return t_icr, t_ich
+
+    def get_all(self, max_bytes: int = 256) -> Tuple[float, float, float, float]:
+        """
+        Read one line and return synchronized (p_room, p_cryo, T_ICR_C, T_ICH_C).
+        Useful when you want pressures and temperatures from the same Arduino frame.
+        """
+
+        v_room, v_cryo, v_icr, v_ich = self.read_voltages(max_bytes)
+        p_room = self._pressure_from_voltage(v_room)
+        p_cryo = self._pressure_from_voltage(v_cryo)
+        t_icr  = self._thermistor_temp_c(v_icr, self.R0_ICR)
+        t_ich  = self._thermistor_temp_c(v_ich, self.R0_ICH)
+
+        return p_room, p_cryo, t_icr, t_ich
+
+
+
+# --------  Convectron Gauge  --------
+class MKS275:
+    """
+    Serial reader for an MKS Mini-Convectron 275 gauge (non-Arduino).
+    Responsibilities:
+      - Manage the serial connection (open/close/status)
+      - Send an ASCII command and read back a CR-terminated response
+      - Extract the raw pressure token as text or convert it to float
+    Protocol (expected):
+      Command  : "#<addr>RD<CR>"
+      Response : "*<addr> <pressure><CR>"
+      where <addr> is a 2-character address string (e.g., "01"), and <CR> is '\\r'.
+    Notes:
+      - This class keeps behavior minimal and explicit: no retries, no validation of units,
+        and no robustness heuristics. Use a higher layer for filtering or error handling.
+      - `dsrdtr=True` is provided because some setups need DSR/DTR flow control asserted.
+    Example:
+        >>> g = MKS275(port="COM6", baudrate=19200, address="01", autoconnect=True)
+        >>> print(g.get_pressure_str())  # e.g., "7.2E-2"
+        >>> print(g.get_pressure())      # e.g., 0.072
+        >>> g.close()
+    """
+
+    def __init__(
+        self,
+        port: str = "COM6",
+        baudrate: int = 19200,
+        timeout: float = 0.5,
+        address: str = "01",
+        autoconnect: bool = True,
+        dsrdtr: bool = True
+    ):
+        """
+        Initialize the serial configuration and optionally connect.
+        Args:
+            port: Serial port (e.g., "COM6" on Windows, "/dev/ttyUSB0" on Linux).
+            baudrate: Serial baud rate; must match the gauge/controller setting.
+            timeout: Read timeout in seconds; empty string is returned on timeout.
+            address: 2-digit gauge address as a string (e.g., "01").
+            autoconnect: If True, open the port immediately.
+            dsrdtr: Whether to enable DSR/DTR hardware flow control.
+        Raises:
+            serial.SerialException: If `autoconnect=True` and the port cannot be opened.
+        """
+
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.address = address
+        self.dsrdtr = dsrdtr
+        self.ser: Optional[serial.Serial] = None
+        if autoconnect:
+            self.connect()
+
+    # --- lifecycle ---
+    def connect(self) -> None:
+        """
+        Open the serial port and clear initial buffers.
+        Behavior:
+            - Closes any existing handle
+            - Opens a new `serial.Serial` with configured parameters
+            - Brief delay to allow the interface to settle
+            - Clears input/output buffers to drop any boot-time noise
+        Raises:
+            serial.SerialException: If the serial port cannot be opened.
+        """
+
+        self.close()
+        self.ser = serial.Serial(
+            self.port,
+            self.baudrate,
+            timeout=self.timeout,
+            bytesize=serial.EIGHTBITS,
+            stopbits=serial.STOPBITS_ONE,
+            parity=serial.PARITY_NONE,
+            dsrdtr=self.dsrdtr
+        )
+        time.sleep(0.1)
+
+        # Clear initial garbage
+        self.ser.reset_input_buffer()
+        self.ser.reset_output_buffer()
+
+    def close(self) -> None:
+        """
+        Close the serial port if open.
+        This method is idempotent and safe to call multiple times.
+        """
+
+        if self.ser and self.ser.is_open:
+            try:
+                self.ser.close()
+            except Exception:
+                # Swallow close errors to keep teardown simple.
+                pass
+
+        self.ser = None
+
+    @property
+    def is_open(self) -> bool:
+        """Return True if the underlying serial port is open; otherwise False."""
+        return bool(self.ser and self.ser.is_open)
+
+    # --- low-level I/O ---
+    def _query(self, cmd: str, max_bytes: int = 128) -> str:
+        """
+        Send an arbitrary ASCII command and read a CR-terminated response.
+        The command is encoded as ASCII and sent as-is. The method reads until
+        a carriage return (b'\\r') or `max_bytes` are received, then decodes the
+        bytes with ASCII (non-ASCII bytes are ignored).
+        Args:
+            cmd: ASCII command to send (should include any required spaces).
+            max_bytes: Maximum number of bytes to read before giving up.
+        Returns:
+            The decoded response string, which may include or exclude trailing CR
+            depending on the device timing and driver behavior.
+        Raises:
+            RuntimeError: If the port is not open.
+        """
+
+        if not self.is_open:
+            raise RuntimeError("Serial port is not open, call connect() first")
+
+        # Clear stale input to reduce the chance of mixing old and new responses.
+        self.ser.reset_input_buffer()
+        self.ser.write(cmd.encode("ascii"))
+        recv = self.ser.read_until(b'\r', max_bytes)
+
+        return recv.decode("ascii", errors="ignore")
+
+    # --- high-level API ---
+    def get_pressure_str(self) -> str:
+        """
+        Request the current pressure and return it as a raw string token.
+        Command sent:
+            "#<address>RD \\r"
+        Expected response:
+            "*<address> <pressure>\\r"
+            For example: "*01 7.2E-2\\r"
+        """
+
+        cmd = f"#{self.address}RD \r"
+        recv = self._query(cmd).strip()
+
+        return recv.split(' ')[1]
+
+    def get_pressure(self) -> float:
+        """
+        Request the current pressure and return it as a float.
+        Calls `get_pressure_str()` and converts the token with `float()`.
+        """
+        return float(self.get_pressure_str())
+
+
+# -------- Test Code --------
+if __name__ == "__main__":
+    # Example: print lines from Arduino as-is (no post-processing)
+    Test_RGM401 = True
+    Test_MKS275 = False
+
+    if Test_RGM401:
+        IG = RGM401AndThermisters(port="COM7", baudrate=115200, timeout=1.0)
+        try:
+            print(f"Port open? {IG.is_open}")
+            while True:
+                p_room, p_cryo, t_icr, t_ich = IG.get_all(256)
+                print(f"p_room = {p_room:.2e} Torr, p_cryo = {p_cryo:.2e} Torr, t_icr = {t_icr} C, t_ich = {t_ich} C")
+                # If your Arduino does not send newline-terminated lines,
+                # use read_text() or read_bytes() instead.
+        except KeyboardInterrupt:
+            print("Stopped by user.")
+        finally:
+            IG.close()
+
+    if Test_MKS275:
+        CG = MKS275(port="COM6", baudrate=19200, timeout=0.5)
+        try:
+            print(f"Port open? {CG.is_open}")
+            while True:
+                p = CG.get_pressure()
+                print(f"p = {p:.2e} Torr")
+        except KeyboardInterrupt:
+            print("Stopped by user.")
+        finally: CG.close()

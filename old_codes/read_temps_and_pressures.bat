@@ -1,0 +1,2 @@
+pythonw C:\Users\Undergrad\Desktop\Logs_Server_Broadcast-master\Logs\readout_dewar_temperatures.py
+pythonw C:\Users\Undergrad\Desktop\Logs_Server_Broadcast-master\Logs\Pressures_reading\Read_Pressures.py

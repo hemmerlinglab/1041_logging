@@ -1,0 +1,1 @@
+python C:\Users\user\Desktop\Logs_Server_Broadcast\readout_dewar_temperatures.py
